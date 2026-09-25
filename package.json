@@ -1,0 +1,10 @@
+{
+  "name": "dsh-repl",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Interactive terminal REPL for DeepSeek Harness via the official ACP profile",
+  "dependencies": {
+    "@agentclientprotocol/sdk": "^1.5.0"
+  }
+}
