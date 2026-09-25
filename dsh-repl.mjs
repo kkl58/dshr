@@ -1,16 +1,15 @@
 #!/usr/bin/env node
 /**
- * dsh-repl —— DeepSeek Harness 的交互式终端
+ * dshr —— DeepSeek Harness 的交互式终端（非官方）
  *
  * 只用官方组件：
- *   - `dsh --profile acp`  ← 官方 ACP (Agent Client Protocol) v1 服务器
- *   - @agentclientprotocol/sdk ← 官方 ACP 客户端 SDK
- *
- * 与 `dsh --profile headless` 的区别：常驻一个进程，多轮对话不重启，
- * 并且带「权限批准」通道（沙箱升权、危险操作都能交互批准）。
+ *   - `dsh --profile acp`       官方 ACP (Agent Client Protocol) v1 服务器
+ *   - @agentclientprotocol/sdk  官方 ACP 客户端 SDK
+ *   ＞ dsh 源码一行未改。
  *
  * 用法：
- *   node dsh-repl.mjs [--cwd <目录>] [--dsh <dsh可执行文件>] [--debug]
+ *   dshr [--cwd <目录>] [--mode <模式>|--full-access] [--dsh <exe>] [--debug]
+ * 会话内： /help  /mode  /cwd  /exit
  */
 
 import { client, ndJsonStream, methods } from "@agentclientprotocol/sdk";
@@ -32,46 +31,97 @@ const CWD = resolve(opt("--cwd", process.cwd()));
 const DSH_BIN = opt("--dsh", "dsh");
 const DEBUG = argv.includes("--debug");
 
-// 沙箱模式：dsh 从 DSH_PERMISSION_MODE 读取（默认 workspace-write）。
-//   read-only | workspace-write | danger-full-access
-// D 盘目录缺 WRITE_OWNER，workspace-write 会起不来（Win32 5）→ 每条命令都要批准。
-// --full-access 直接关掉沙箱介入：不改 ACL、不打 Low 标签、免批准。
-const MODE =
-  opt("--mode", null) ??
-  (argv.includes("--full-access") ? "danger-full-access" : null);
+/* ---------------------------- 权限模式 ---------------------------- */
+
+// 官方三种模式（dsh-sandbox-policy 的封闭词汇）。dsh 从 DSH_PERMISSION_MODE 读取。
+// ACP 协议本身有 session/set_mode，但 dsh 未对外公布任何 modes（modes: undefined），
+// 所以本工具用「重启进程 + session/resume 续接会话」实现切换。
+const MODES = {
+  "read-only": {
+    zh: "只读", en: "Read Only", alias: ["只读", "readonly", "ro", "view"],
+    desc: "不能写任何文件（仅可查看）。越权写操作会被拒绝。",
+  },
+  "workspace-write": {
+    zh: "工作区内修改", en: "Workspace Write", alias: ["手工", "manual", "work", "ww"],
+    desc: "只能写工作区目录内；需要越权时弹出批准框，一条一条问你 —— 最接近 Claude Code 的默认模式。",
+  },
+  "danger-full-access": {
+    zh: "完全权限", en: "Full Access", alias: ["自动", "auto", "full", "yolo"],
+    desc: "无文件系统限制、不弹批准。⚠️ 不是 Claude Code 那种「智能判断」—— dsh 的分类器不经 ACP 暴露，所以这里的「自动」= 全部放行。",
+  },
+};
+const MODE_IDS = Object.keys(MODES);
+
+function normalizeMode(v) {
+  if (!v) return null;
+  const s = String(v).trim().toLowerCase();
+  if (MODES[s]) return s;
+  for (const [id, m] of Object.entries(MODES)) {
+    if (m.alias.some((a) => a.toLowerCase() === s)) return id;
+  }
+  return null;
+}
+
+let currentMode =
+  normalizeMode(opt("--mode", argv.includes("--full-access") ? "danger-full-access" : null)) ??
+  normalizeMode(process.env.DSH_PERMISSION_MODE) ??
+  "workspace-write";
 
 /* ------------------------------ 颜色 ------------------------------ */
 
 const C = {
   dim: "\x1b[2m", bold: "\x1b[1m", reset: "\x1b[0m",
   cyan: "\x1b[36m", green: "\x1b[32m", yellow: "\x1b[33m",
-  red: "\x1b[31m", gray: "\x1b[90m", magenta: "\x1b[35m",
+  red: "\x1b[31m", gray: "\x1b[90m", magenta: "\x1b[35m", blue: "\x1b[34m",
 };
 const out = (s = "") => process.stdout.write(s + "\n");
 
-/* ------------------------------ 终端输入 ------------------------------ */
+// 小鲸鱼（DeepSeek 的 logo 就是鲸鱼）
+const WHALE = [
+  "        ▄▄▄▄▄▄▄▄",
+  "     ▄████████████▄",
+  "   ███▀            ▀███▄",
+  "  ██▀   ●      ●     ▀██▄",
+  "  ██                    ███",
+  "  ▀██▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄████▀",
+  "    ▀▀████████████▀▀",
+];
+
+function modeLabel(id = currentMode) {
+  const m = MODES[id];
+  return `${C.green}${m?.zh ?? id}${C.reset} ${C.gray}(${id})${C.reset}`;
+}
+const promptStr = () => `${C.cyan}dsh${C.gray}[${currentMode}]${C.cyan}>${C.reset} `;
+
+function banner() {
+  const info = [
+    `${C.bold}dshr${C.reset} ${C.gray}· DeepSeek Harness 交互式终端${C.reset}`,
+    `${C.gray}非官方 · 官方 ACP 通道 · 未修改 dsh 源码${C.reset}`,
+    ``,
+    `${C.gray}工作区${C.reset}   ${CWD}`,
+    `${C.gray}权限模式${C.reset} ${modeLabel()}`,
+  ];
+  for (let i = 0; i < WHALE.length; i++) {
+    const left = `${C.blue}${WHALE[i]}${C.reset}`;
+    out(info[i] ? `${left}   ${info[i]}` : left);
+  }
+  for (let i = WHALE.length; i < info.length; i++) out(info[i]);
+  out(`${C.gray}输入 /help 看命令，/mode 切权限模式。${C.reset}`);
+  out();
+}
+
+/* ------------------------------ 输入 ------------------------------ */
 
 const rl = createInterface({
   input: process.stdin,
   output: process.stdout,
   terminal: process.stdin.isTTY === true,
 });
-
-// 行队列：readline 会立刻消费输入（管道喂进来的行也一并吞掉），
-// 所以不能直接 rl.question()，必须先把行缓冲起来，需要时再取。
 const lineQueue = [];
 const waiters = [];
 let inputClosed = false;
-
-rl.on("line", (l) => {
-  const w = waiters.shift();
-  if (w) w(l);
-  else lineQueue.push(l);
-});
-rl.on("close", () => {
-  inputClosed = true;
-  while (waiters.length) waiters.shift()(null); // null = EOF
-});
+rl.on("line", (l) => { const w = waiters.shift(); if (w) w(l); else lineQueue.push(l); });
+rl.on("close", () => { inputClosed = true; while (waiters.length) waiters.shift()(null); });
 
 function ask(q) {
   process.stdout.write(q);
@@ -80,18 +130,32 @@ function ask(q) {
   return new Promise((r) => waiters.push(r));
 }
 
-// 流式输出时是否已在本行写过内容（用于决定要不要补换行）
+/* --------------------------- 输出渲染 --------------------------- */
+
 let lineOpen = false;
 const streamWrite = (s) => { lineOpen = true; process.stdout.write(s); };
 const closeLine = () => { if (lineOpen) { process.stdout.write("\n"); lineOpen = false; } };
 
-/* --------------------------- 会话状态 --------------------------- */
+const toolCalls = new Map(); // toolCallId -> { title, kind, detail, status }
 
-const toolCalls = new Map(); // toolCallId -> { title, kind }
-let session = null;
-let turnCount = 0;
+/** 从工具入参里提炼一句人类可读的摘要（命令 / 路径 / 模式） */
+function summarizeInput(input) {
+  if (!input) return "";
+  if (typeof input === "string") return input;
+  const cmd = input.command ?? input.cmd ?? input.script;
+  if (typeof cmd === "string") return cmd;
+  const p =
+    input.path ?? input.file_path ?? input.filePath ?? input.target_file ??
+    input.pattern ?? input.url ?? input.query;
+  if (typeof p === "string") return p;
+  if (Array.isArray(input.paths) && input.paths.length) return input.paths.join(", ");
+  return "";
+}
 
-/* --------------------------- 上游事件渲染 --------------------------- */
+function firstLine(s, n = 160) {
+  const t = String(s ?? "").replace(/\s+/g, " ").trim();
+  return t.length > n ? t.slice(0, n - 1) + "…" : t;
+}
 
 function renderUpdate(u) {
   switch (u.sessionUpdate) {
@@ -106,44 +170,43 @@ function renderUpdate(u) {
       const c = u.content;
       if (c?.type === "text") {
         closeLine();
-        out(`${C.gray}${C.dim}💭 ${String(c.text).trim()}${C.reset}`);
+        out(`${C.dim}${C.gray}💭 ${firstLine(c.text, 240)}${C.reset}`);
       }
       break;
     }
     case "tool_call": {
       closeLine();
-      const title = u.title ?? u.kind ?? "工具";
-      toolCalls.set(u.toolCallId, { title, kind: u.kind });
-      out(`${C.cyan}⚙ ${title}${C.reset}${u.status ? ` ${C.gray}(${u.status})${C.reset}` : ""}`);
+      const detail = summarizeInput(u.rawInput);
+      toolCalls.set(u.toolCallId, {
+        title: u.title ?? u.kind ?? "工具", kind: u.kind, detail, status: u.status,
+      });
+      const kind = u.kind ? `${C.gray}${u.kind}${C.reset} ` : "";
+      out(`${C.cyan}⏺ ${kind}${C.reset}${firstLine(detail || u.title || "工具调用", 170)}`);
       break;
     }
     case "tool_call_update": {
-      const prev = toolCalls.get(u.toolCallId);
-      // 只报状态变化，避免刷屏
-      if (u.status && u.status !== prev?.status) {
+      const prev = toolCalls.get(u.toolCallId) ?? {};
+      if (u.status && u.status !== prev.status) {
         closeLine();
         const color = u.status === "failed" ? C.red : u.status === "completed" ? C.green : C.gray;
-        out(`${color}  └ ${u.title ?? prev?.title ?? u.toolCallId} → ${u.status}${C.reset}`);
-        if (prev) prev.status = u.status;
+        const mark = u.status === "failed" ? "✗" : u.status === "completed" ? "✓" : "…";
+        const label = firstLine(u.title ?? prev.detail ?? prev.title ?? u.toolCallId, 120);
+        out(`${color}  ${mark} ${u.status}${C.reset}${C.gray} · ${label}${C.reset}`);
+        prev.status = u.status;
+        toolCalls.set(u.toolCallId, prev);
       }
       break;
     }
     case "notice": {
       closeLine();
-      const t = u.content?.text ?? u.message ?? JSON.stringify(u);
-      out(`${C.yellow}⚠ ${t}${C.reset}`);
+      out(`${C.yellow}⚠ ${firstLine(u.content?.text ?? u.message ?? JSON.stringify(u), 300)}${C.reset}`);
       break;
     }
-    case "usage_update": {
-      if (DEBUG) { closeLine(); out(`${C.gray}[usage] ${JSON.stringify(u)}${C.reset}`); }
+    case "current_mode_update": {
+      closeLine();
+      out(`${C.magenta}◆ 会话模式变为: ${u.modeId ?? JSON.stringify(u)}${C.reset}`);
       break;
     }
-    case "available_commands_update":
-    case "session_info_update":
-    case "config_option_update":
-    case "current_mode_update":
-      if (DEBUG) { closeLine(); out(`${C.gray}[${u.sessionUpdate}] ${JSON.stringify(u).slice(0, 200)}${C.reset}`); }
-      break;
     default:
       if (DEBUG) { closeLine(); out(`${C.gray}[${u.sessionUpdate}] ${JSON.stringify(u).slice(0, 300)}${C.reset}`); }
   }
@@ -154,39 +217,32 @@ function renderUpdate(u) {
 async function handlePermission({ params }) {
   closeLine();
   const tool = params.toolCall ?? {};
-  // 批准请求往往只带 toolCallId，标题要从之前那条 tool_call 更新里取
   const known = toolCalls.get(tool.toolCallId) ?? {};
-  const title = tool.title ?? known.title ?? tool.kind ?? known.kind ?? "工具调用";
+  const detail =
+    summarizeInput(tool.rawInput) || known.detail ||
+    firstLine(tool.title ?? known.title ?? "", 200) || "(无详情)";
+  const kind = tool.kind ?? known.kind ?? "other";
 
   out("");
-  out(`${C.yellow}${C.bold}┌─ 需要你批准 ─────────────────────────────${C.reset}`);
-  out(`${C.yellow}│${C.reset} ${C.bold}${title}${C.reset}`);
-  if (tool.kind ?? known.kind) out(`${C.yellow}│${C.reset} ${C.gray}类型: ${tool.kind ?? known.kind}${C.reset}`);
-  const raw =
-    tool.rawInput ??
-    tool.content?.find?.((c) => c.type === "content")?.content ??
-    null;
-  if (raw) {
-    const text = typeof raw === "string" ? raw : JSON.stringify(raw, null, 1);
-    for (const line of text.split("\n").slice(0, 14)) out(`${C.yellow}│${C.reset} ${C.gray}${line}${C.reset}`);
+  out(`${C.yellow}${C.bold}╭─ 需要你批准 ────────────────────────────────${C.reset}`);
+  out(`${C.yellow}│${C.reset} ${C.bold}${kind}${C.reset} ${C.gray}${firstLine(known.title ?? tool.title ?? "", 80)}${C.reset}`);
+  for (const l of String(detail).split("\n").slice(0, 10)) {
+    out(`${C.yellow}│${C.reset} ${C.bold}${l.slice(0, 200)}${C.reset}`);
   }
-  out(`${C.yellow}└──────────────────────────────────────────${C.reset}`);
-  if (!MODE && params.options?.some((o) => o.kind?.startsWith("allow"))) {
-    out(`${C.gray}  提示：D 盘工作区每条命令都要批准。想免批准可退出后用 dshr --full-access 重开。${C.reset}`);
-  }
+  out(`${C.yellow}╰─────────────────────────────────────────────${C.reset}`);
 
   const options = params.options ?? [];
   options.forEach((o, i) => {
     const label = o.kind?.startsWith("allow") ? C.green : C.red;
     out(`  ${C.bold}${i + 1}${C.reset}) ${label}${o.name}${C.reset} ${C.gray}(${o.kind})${C.reset}`);
   });
+  out(`${C.gray}  输序号选择，直接回车 = 拒绝。不想再被逐条问，用 /mode 切权限模式。${C.reset}`);
 
-  const rawAnswer = await ask(`${C.cyan}选择 [1-${options.length}]，直接回车=拒绝: ${C.reset}`);
-  const answer = (rawAnswer ?? "").trim();
-
+  const raw = await ask(`${C.cyan}选择 [1-${options.length}]: ${C.reset}`);
+  const answer = (raw ?? "").trim();
   if (!answer) {
-    const reject = options.find((o) => o.kind?.startsWith("reject")) ?? options[options.length - 1];
-    return { outcome: { outcome: "selected", optionId: reject.optionId } };
+    const rej = options.find((o) => o.kind?.startsWith("reject")) ?? options[options.length - 1];
+    return { outcome: { outcome: "selected", optionId: rej.optionId } };
   }
   const n = Number.parseInt(answer, 10);
   const chosen = Number.isFinite(n) && n >= 1 && n <= options.length ? options[n - 1] : null;
@@ -194,123 +250,175 @@ async function handlePermission({ params }) {
   return { outcome: { outcome: "selected", optionId: chosen.optionId } };
 }
 
-/* --------------------------- 组装 ACP 客户端 --------------------------- */
+/* --------------------------- ACP 客户端 --------------------------- */
 
-const app = client({ name: "dsh-repl" })
-  // 流式事件
-  .onNotification(methods.client.session.update, ({ params }) => {
-    if (DEBUG) out(`${C.gray}<< ${JSON.stringify(params).slice(0, 400)}${C.reset}`);
-    renderUpdate(params.update);
-  })
-  // 权限批准（这就是 headless 缺的那条通道）
-  .onRequest(methods.client.session.requestPermission, handlePermission)
-  // 文件读取：ACP 约定由客户端提供文件系统能力
-  .onRequest(methods.client.fs.readTextFile, async ({ params }) => {
-    try {
-      const text = await readFile(params.path, "utf8");
-      return { content: text };
-    } catch (e) {
-      throw new Error(`读取失败 ${params.path}: ${e.message}`);
-    }
-  })
-  .onRequest(methods.client.fs.writeTextFile, async ({ params }) => {
-    try {
-      await writeFile(params.path, params.content ?? "", "utf8");
-      return {};
-    } catch (e) {
-      throw new Error(`写入失败 ${params.path}: ${e.message}`);
-    }
-  });
-
-/* --------------------------- 启动 & 主循环 --------------------------- */
-
-// Windows 上 dsh 是 .cmd，不能直接 spawn（会 EINVAL），但也别用 shell:true
-// （那会把参数拼成字符串，Node 会告警）。走 cmd.exe /c，参数仍按数组传。
-const isWin = process.platform === "win32";
-const spawnCmd = isWin ? process.env.ComSpec || "cmd.exe" : DSH_BIN;
-const spawnArgs = isWin
-  ? ["/d", "/s", "/c", `${DSH_BIN} --profile acp`]
-  : ["--profile", "acp"];
-
-const child = spawn(spawnCmd, spawnArgs, {
-  cwd: CWD,
-  stdio: ["pipe", "pipe", "pipe"],
-  windowsHide: true,
-  env: MODE ? { ...process.env, DSH_PERMISSION_MODE: MODE } : process.env,
-});
-
-child.on("error", (e) => { out(`${C.red}无法启动 dsh：${e.message}${C.reset}`); process.exit(1); });
-
-// 上游诊断日志：默认折叠，--debug 时透传
-child.stderr.on("data", (b) => {
-  const s = b.toString();
-  if (DEBUG) process.stderr.write(`${C.gray}${s}${C.reset}`);
-  else process.stderr.write(""); // 丢弃
-});
-
-child.on("exit", (code) => {
-  closeLine();
-  out(`${C.gray}dsh 已退出（code=${code}）${C.reset}`);
-  rl.close();
-  process.exit(0);
-});
-
-const stream = ndJsonStream(Writable.toWeb(child.stdin), Readable.toWeb(child.stdout));
-
-out(`${C.bold}DeepSeek Harness${C.reset} ${C.gray}· 官方 ACP 通道 · 交互式终端${C.reset}`);
-out(`${C.gray}工作区: ${CWD}${C.reset}`);
-if (MODE) out(`${C.yellow}沙箱模式: ${MODE}${C.reset}`);
-
-try {
-  await app.connectWith(stream, async (ctx) => {
-    // ACP 握手
-    const init = await ctx.request(methods.agent.initialize, {
-      protocolVersion: 1,
-      clientCapabilities: {
-        fs: { readTextFile: true, writeTextFile: true },
-        terminal: false,
-      },
+function buildClient() {
+  return client({ name: "dshr" })
+    .onNotification(methods.client.session.update, ({ params }) => {
+      if (DEBUG) out(`${C.gray}<< ${JSON.stringify(params).slice(0, 400)}${C.reset}`);
+      renderUpdate(params.update);
+    })
+    .onRequest(methods.client.session.requestPermission, handlePermission)
+    .onRequest(methods.client.fs.readTextFile, async ({ params }) => {
+      try { return { content: await readFile(params.path, "utf8") }; }
+      catch (e) { throw new Error(`读取失败 ${params.path}: ${e.message}`); }
+    })
+    .onRequest(methods.client.fs.writeTextFile, async ({ params }) => {
+      try { await writeFile(params.path, params.content ?? "", "utf8"); return {}; }
+      catch (e) { throw new Error(`写入失败 ${params.path}: ${e.message}`); }
     });
-    if (DEBUG) out(`${C.gray}[initialize] ${JSON.stringify(init)}${C.reset}`);
-
-    // 建会话
-    const active = await ctx.buildSession(CWD).start();
-    session = active;
-    out(`${C.gray}会话已建立。输入 /exit 退出，/help 看命令。${C.reset}`);
-    out("");
-
-    // 交互循环
-    while (true) {
-      const raw = await ask(`${C.cyan}dsh>${C.reset} `);
-      if (raw === null) { out(""); out(`${C.gray}输入结束，退出。${C.reset}`); break; }
-      const line = raw.trim();
-      if (!line) continue;
-      if (line === "/exit" || line === "/quit") break;
-      if (line === "/help") {
-        out(`${C.gray}/exit 退出   /help 帮助   /cwd 显示工作区${C.reset}`);
-        continue;
-      }
-      if (line === "/cwd") { out(`${CWD}`); continue; }
-
-      turnCount++;
-      lineOpen = false;
-      out("");
-      try {
-        const res = await active.prompt(line);
-        closeLine();
-        out(`${C.gray}── 第 ${turnCount} 轮结束 · ${res?.stopReason ?? "?"}${C.reset}`);
-      } catch (e) {
-        closeLine();
-        out(`${C.red}本轮出错：${e.message}${C.reset}`);
-      }
-      out("");
-    }
-  });
-} catch (e) {
-  closeLine();
-  out(`${C.red}连接失败：${e?.message ?? e}${C.reset}`);
-  if (DEBUG) console.error(e);
-} finally {
-  try { child.kill(); } catch {}
-  rl.close();
 }
+
+/* --------------------------- 启动 agent --------------------------- */
+
+const isWin = process.platform === "win32";
+
+function spawnAgent(mode) {
+  const spawnCmd = isWin ? process.env.ComSpec || "cmd.exe" : DSH_BIN;
+  const spawnArgs = isWin ? ["/d", "/s", "/c", `${DSH_BIN} --profile acp`] : ["--profile", "acp"];
+  const child = spawn(spawnCmd, spawnArgs, {
+    cwd: CWD,
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+    env: { ...process.env, DSH_PERMISSION_MODE: mode },
+  });
+  child.on("error", (e) => { out(`${C.red}无法启动 dsh：${e.message}${C.reset}`); process.exit(1); });
+  child.stderr.on("data", (b) => { if (DEBUG) process.stderr.write(`${C.gray}${b}${C.reset}`); });
+  return child;
+}
+
+/* --------------------------- 单次会话 --------------------------- */
+
+/** 返回 null = 用户退出；返回 {mode, resumeId} = 请求换模式后重启 */
+async function runSession(mode, resumeId) {
+  const child = spawnAgent(mode);
+  const app = buildClient();
+  const stream = ndJsonStream(Writable.toWeb(child.stdin), Readable.toWeb(child.stdout));
+  let sessionId = null;
+  let restart = null;
+
+  try {
+    await app.connectWith(stream, async (ctx) => {
+      const init = await ctx.request(methods.agent.initialize, {
+        protocolVersion: 1,
+        clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: false },
+      });
+      if (DEBUG) out(`${C.gray}[initialize] ${JSON.stringify(init).slice(0, 300)}${C.reset}`);
+
+      // 换模式重启时，尽量续接原会话
+      if (resumeId) {
+        try {
+          await ctx.request(methods.agent.session.resume, { sessionId: resumeId, cwd: CWD });
+          sessionId = resumeId;
+          out(`${C.gray}已续接会话 ${String(sessionId).slice(0, 8)}（旧历史不会重绘）${C.reset}`);
+        } catch (e) {
+          out(`${C.yellow}续接失败（${firstLine(e.message, 80)}），改为新会话${C.reset}`);
+        }
+      }
+      if (!sessionId) {
+        const active = await ctx.buildSession(CWD).start();
+        sessionId = active.sessionId;
+      }
+
+      while (true) {
+        const raw = await ask(promptStr());
+        if (raw === null) return;
+        const line = raw.trim();
+        if (!line) continue;
+
+        /* ---- 本地命令 ---- */
+        if (line === "/exit" || line === "/quit") return;
+        if (line === "/help") { printHelp(); continue; }
+        if (line === "/cwd") { out(`  ${CWD}`); continue; }
+        if (line === "/mode" || line.startsWith("/mode ")) {
+          const argRaw = line.slice(5).trim();
+          if (!argRaw) { printModes(sessionId); continue; }
+          const target = normalizeMode(argRaw);
+          if (!target) {
+            out(`${C.red}未知模式「${argRaw}」。可用：${MODE_IDS.join(" / ")}`);
+            out(`别名：${Object.values(MODES).flatMap((m) => m.alias).join(" / ")}${C.reset}`);
+            continue;
+          }
+          if (target === mode) { out(`${C.gray}已经是 ${target} 了${C.reset}`); continue; }
+          out(`${C.gray}切换 ${mode} → ${target}：重启 agent 并续接会话…${C.reset}`);
+          restart = { mode: target, resumeId: sessionId };
+          return;
+        }
+
+        /* ---- 交给 agent ---- */
+        lineOpen = false;
+        out("");
+        try {
+          const res = await ctx.request(methods.agent.session.prompt, {
+            sessionId,
+            prompt: [{ type: "text", text: line }],
+          });
+          closeLine();
+          out(`${C.gray}── ${res?.stopReason ?? "?"}${C.reset}`);
+        } catch (e) {
+          closeLine();
+          out(`${C.red}本轮出错：${firstLine(e.message, 200)}${C.reset}`);
+        }
+        out("");
+      }
+    });
+  } catch (e) {
+    closeLine();
+    out(`${C.red}连接失败：${firstLine(e?.message ?? String(e), 200)}${C.reset}`);
+    if (DEBUG) console.error(e);
+    restart = null;
+  } finally {
+    try { child.kill(); } catch {}
+  }
+  return restart;
+}
+
+/* ------------------------------ 帮助 ------------------------------ */
+
+function printModes(sessionId) {
+  out(`\n${C.bold}权限模式${C.reset} ${C.gray}(当前: ${currentMode})${C.reset}`);
+  for (const id of MODE_IDS) {
+    const m = MODES[id];
+    const mark = id === currentMode ? `${C.green}●${C.reset}` : "○";
+    out(`  ${mark} ${C.bold}${m.zh}${C.reset} ${C.gray}${id}${C.reset}`);
+    out(`     ${m.desc}`);
+    out(`     ${C.gray}别名: ${m.alias.join(" / ")}${C.reset}`);
+  }
+  out(`\n  ${C.gray}切换：${C.bold}/mode <名称>${C.reset}${C.gray}（重启 agent 并续接同一会话）${C.reset}`);
+  out(`  ${C.gray}会话 id：${sessionId}${C.reset}\n`);
+}
+
+function printHelp() {
+  out(`
+${C.bold}会话内命令${C.reset}
+  ${C.bold}/help${C.reset}          显示本帮助
+  ${C.bold}/mode${C.reset}          查看当前权限模式与可选项
+  ${C.bold}/mode <名称>${C.reset}   切换权限模式（重启 agent，续接同一会话）
+  ${C.bold}/cwd${C.reset}           显示工作区
+  ${C.bold}/exit${C.reset}          退出
+
+${C.bold}启动参数${C.reset}
+  --cwd <目录>     指定工作区（默认当前目录）
+  --mode <模式>    起始权限模式：read-only | workspace-write | danger-full-access
+  --full-access    等价于 --mode danger-full-access
+  --dsh <路径>     指定 dsh 可执行文件
+  --debug          打印原始 ACP 事件与上游 stderr
+`);
+}
+
+/* ------------------------------ 主循环 ------------------------------ */
+
+banner();
+
+let resumeId = null;
+while (true) {
+  const next = await runSession(currentMode, resumeId);
+  if (!next) break;
+  currentMode = next.mode;
+  resumeId = next.resumeId;
+  out(`\n${C.gray}── 已切换到 ${modeLabel()} ──${C.reset}\n`);
+}
+
+closeLine();
+out(`${C.gray}再见 🐋${C.reset}`);
+rl.close();

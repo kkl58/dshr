@@ -78,8 +78,24 @@ In-session: `/exit`, `/help`, `/cwd`.
 ### Permission modes
 
 dsh's sandbox mode is read from the `DSH_PERMISSION_MODE` environment variable, and this tool
-simply sets it for the child process. The three official modes are `read-only`,
-`workspace-write` (default) and `danger-full-access`.
+sets it for the child process. The three official modes are:
+
+| Mode | Meaning | Aliases |
+|---|---|---|
+| `read-only` | no writes at all | `只读`, `ro` |
+| `workspace-write` (default) | writes only inside the workspace; anything beyond asks you first | `手工`, `manual` |
+| `danger-full-access` | no filesystem restriction, no prompts | `自动`, `auto` |
+
+Switch at runtime with `/mode <name>`; bare `/mode` lists them. Note that `danger-full-access`
+is **not** an "auto" in the Claude Code sense — dsh's classifier is not exposed over ACP, so
+here "auto" simply means *everything is allowed*.
+
+**Why switching restarts the process.** ACP v1 does have `session/set_mode`, and this client
+implements the handler path. But dsh publishes no session modes over ACP
+(`newSession` returns `modes: undefined`), so there is nothing to set. Modes are therefore
+changed by respawning the agent with a different `DSH_PERMISSION_MODE` and continuing the same
+session via `session/resume` — the conversation carries on (the old transcript is not redrawn).
+The agent itself cannot self-escalate, which is the intended design.
 
 > ### ⚠️ `--full-access` removes the filesystem sandbox
 >
@@ -142,8 +158,9 @@ is the SDK itself (`zod` comes with it). That is the whole point of the project.
 
 ## Known limitations
 
-- **No in-session mode switching.** ACP exposes no private methods by design, so the sandbox
-  mode is chosen at startup only.
+- **Mode switching restarts the agent.** It works and the session is resumed, but there is a
+  short pause and the previous transcript is not redrawn (see "Why switching restarts the
+  process" above).
 - **No Markdown rendering.** Streamed text is written as-is (ANSI colours for structure only).
 - **No session picker.** Each run starts a fresh session; dsh's own session store still holds
   the history.
@@ -193,7 +210,21 @@ node dsh-repl.mjs --full-access   # = danger-full-access
 node dsh-repl.mjs --debug         # 看原始 ACP 事件
 ```
 
-会话内：`/exit`、`/help`、`/cwd`。要求 `dsh` 在 PATH 上、Node.js 20+。
+会话内命令：`/help`、`/mode`（查看/切换权限模式）、`/cwd`、`/exit`。
+
+**权限模式**（`/mode <名称>`，支持中文别名）：
+
+| 模式 | 含义 | 别名 |
+|---|---|---|
+| `read-only` | 完全不能写 | `只读`、`ro` |
+| `workspace-write`（默认） | 只能写工作区内，越权时弹批准框问你 | `手工`、`manual` |
+| `danger-full-access` | 无文件系统限制、不弹批准 | `自动`、`auto` |
+
+⚠️ 这里的「自动」**不是** Claude Code 那种智能判断 —— dsh 的分类器不经 ACP 暴露，所以「自动」= **全部放行**。
+
+**为什么切换要重启进程**：ACP v1 本身有 `session/set_mode`，但 **dsh 没有公布任何会话模式**（`newSession` 返回 `modes: undefined`），所以没有东西可设。本工具改用「换 `DSH_PERMISSION_MODE` 重启 agent + `session/resume` 续接同一会话」来实现切换 —— 对话能接着聊，只是旧记录不会重绘。agent 自身无法自我提权，这是官方设计。
+
+要求 `dsh` 在 PATH 上、Node.js 20+。
 
 > ### ⚠️ `--full-access` 会关闭文件系统沙箱
 > 它设 `DSH_PERMISSION_MODE=danger-full-access`，**agent 的命令不再受任何文件系统限制**。
@@ -219,7 +250,7 @@ Low 标签，先读官方 `dsh-sandbox-windows-acl` 文档**）/ 保持默认模
 
 ## 已知限制
 
-- **不支持会话内切换模式**（ACP 按设计不暴露私有方法，只能在启动时选定）
+- **切换模式会重启 agent**（会续接会话，但有短暂停顿，且旧记录不重绘）
 - **不渲染 Markdown** / **没有会话选择器**
 - Git Bash 里启动器要写全名 `dshr.bat`（MSYS 不自动补 `.bat`）
 - 在 Windows 11 + dsh `0.1.7-rc.2` 上测试。dsh 是开发者预览版，协议可能变化
