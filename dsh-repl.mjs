@@ -17,7 +17,9 @@ import { spawn } from "node:child_process";
 import { Readable, Writable } from "node:stream";
 import { createInterface } from "node:readline";
 import { readFile, writeFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { resolve, relative, isAbsolute, join } from "node:path";
+import os from "node:os";
 import process from "node:process";
 
 /* ------------------------------ 参数 ------------------------------ */
@@ -30,6 +32,50 @@ const opt = (name, def) => {
 const CWD = resolve(opt("--cwd", process.cwd()));
 const DSH_BIN = opt("--dsh", "dsh");
 const DEBUG = argv.includes("--debug");
+
+/* --------------------------- 工作区体检 --------------------------- */
+
+function isInside(parent, child) {
+  const p = resolve(parent), c = resolve(child);
+  if (p === c) return true;
+  const rel = relative(p, c);
+  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+}
+
+/**
+ * Windows ACL 沙箱硬性要求「临时目录在工作区之外」。
+ * 默认 TEMP 在 C:\Users\<你>\AppData\Local\Temp —— 一旦工作区就是 C:\Users\<你>，
+ * 沙箱会直接报 "Windows ACL temp root must be outside the workspace"，
+ * 于是所有 shell 命令全废（连读文件都受影响）。
+ * 这里挑一个确定在工作区之外的临时目录注入给子进程。
+ */
+function writableDir(dir) {
+  try {
+    mkdirSync(dir, { recursive: true });
+    const probe = join(dir, `.dshr-probe-${process.pid}`);
+    writeFileSync(probe, "ok");
+    rmSync(probe, { force: true });
+    return true;
+  } catch { return false; }
+}
+
+function pickTempDir(workspace) {
+  // 候选顺序：用户私有 → 公共可写（家目录当工作区时唯一的出路）→ 系统临时 → 其他盘
+  const candidates = [
+    join(os.homedir(), ".dshr-tmp"),
+    process.env.PUBLIC ? join(process.env.PUBLIC, "dshr-tmp") : "C:\\Users\\Public\\dshr-tmp",
+    os.tmpdir(),
+  ];
+  for (const c of candidates) {
+    if (isInside(workspace, c)) continue;      // 必须在工作区之外
+    if (writableDir(c)) return c;              // 而且必须真的可写
+  }
+  return null;
+}
+
+const TEMP_DIR = pickTempDir(CWD);
+// 工作区在系统盘用户目录之外时（比如 D 盘），沙箱还可能因 ACL 缺 WRITE_OWNER 失败 —— 见 README。
+const TEMP_PROBLEM = !TEMP_DIR || isInside(CWD, resolve(process.env.TEMP || process.env.TMP || ""));
 
 /* ---------------------------- 权限模式 ---------------------------- */
 
@@ -106,6 +152,9 @@ function banner() {
     out(info[i] ? `${left}   ${info[i]}` : left);
   }
   for (let i = WHALE.length; i < info.length; i++) out(info[i]);
+  if (!/^[Cc]:/.test(CWD)) {
+    out(`${C.gray}提示：工作区不在 C 盘。某些盘上 dsh 沙箱起不来（ACL 缺 WRITE_OWNER），遇阻用 /mode 切「自动」。${C.reset}`);
+  }
   out(`${C.gray}输入 /help 看命令，/mode 切权限模式。${C.reset}`);
   out();
 }
@@ -157,6 +206,23 @@ function firstLine(s, n = 160) {
   return t.length > n ? t.slice(0, n - 1) + "…" : t;
 }
 
+/* --------------- 沙箱失败识别：给一次可执行的提示 --------------- */
+
+const hinted = new Set();
+function sandboxHint(kind) {
+  if (hinted.has(kind)) return;
+  hinted.add(kind);
+  closeLine();
+  if (kind === "acl") {
+    out(`${C.yellow}⚠ shell 跑不起来：这个盘的工作区目录没授予你 WRITE_OWNER（Windows ACL 前提）${C.reset}`);
+    out(`  ${C.gray}→ 最快：${C.reset}${C.bold}/mode 自动${C.reset}${C.gray}  —— 免批准、不改 ACL（代价：沙箱不生效）${C.reset}`);
+    out(`  ${C.gray}→ 想保留沙箱：把工作区放到 ${C.reset}C:\\Users\\${process.env.USERNAME ?? "<你>"}${C.gray} 下面${C.reset}`);
+  } else if (kind === "temp") {
+    out(`${C.yellow}⚠ shell 跑不起来：临时目录落在工作区内部${C.reset}`);
+    out(`  ${C.gray}→ 别在家目录本身运行；换个子目录，或用 ${C.reset}${C.bold}/mode 自动${C.reset}`);
+  }
+}
+
 function renderUpdate(u) {
   switch (u.sessionUpdate) {
     case "agent_message_chunk": {
@@ -195,6 +261,10 @@ function renderUpdate(u) {
         prev.status = u.status;
         toolCalls.set(u.toolCallId, prev);
       }
+      // 沙箱类失败：给一次人话提示，别让 agent 自己瞎试
+      const blob = JSON.stringify(u);
+      if (/SetNamedSecurityInfoW/.test(blob)) sandboxHint("acl");
+      else if (/temp root must be outside the workspace/i.test(blob)) sandboxHint("temp");
       break;
     }
     case "notice": {
@@ -276,11 +346,14 @@ const isWin = process.platform === "win32";
 function spawnAgent(mode) {
   const spawnCmd = isWin ? process.env.ComSpec || "cmd.exe" : DSH_BIN;
   const spawnArgs = isWin ? ["/d", "/s", "/c", `${DSH_BIN} --profile acp`] : ["--profile", "acp"];
+  const env = { ...process.env, DSH_PERMISSION_MODE: mode };
+  // 把临时目录指到工作区之外，否则 ACL 沙箱会直接拒绝启动（shell 全废）
+  if (TEMP_DIR) { env.TEMP = TEMP_DIR; env.TMP = TEMP_DIR; }
   const child = spawn(spawnCmd, spawnArgs, {
     cwd: CWD,
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
-    env: { ...process.env, DSH_PERMISSION_MODE: mode },
+    env,
   });
   child.on("error", (e) => { out(`${C.red}无法启动 dsh：${e.message}${C.reset}`); process.exit(1); });
   child.stderr.on("data", (b) => { if (DEBUG) process.stderr.write(`${C.gray}${b}${C.reset}`); });

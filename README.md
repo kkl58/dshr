@@ -144,6 +144,28 @@ alike. Your options, in the order I'd rank them:
 4. **Approve each command** — leave the mode at the default and answer the prompt. This is
    effectively "always ask" mode.
 
+### A second Windows precondition: the temp root must be outside the workspace
+
+Independently of the ACL issue, the sandbox refuses to start when the environment temp root
+lies inside the workspace:
+
+```
+Error: Windows ACL temp root must be outside the workspace: workspace=…; temp=…
+```
+
+This bites when you run from your **home directory**: `%TEMP%` is `C:\Users\<you>\AppData\Local\Temp`,
+which is inside `C:\Users\<you>`. Every shell command fails, reads included — so the agent
+cannot even look at other drives.
+
+`dshr` handles this: it picks a writable temp directory outside the workspace and passes it to
+the agent as `TEMP`/`TMP`. When the workspace is the home directory, the only writable location
+outside it on `C:` is `C:\Users\Public\dshr-tmp`, which is what it falls back to. If you would
+rather not use a public directory, run from a project subdirectory instead and the default
+`~/.dshr-tmp` is used.
+
+Reads themselves are not restricted by the sandbox — with a working sandbox the agent can read
+anywhere you can; only writes are confined to the workspace.
+
 ## How it compares to other community front-ends
 
 Several community TUIs exist for dsh (for example `dsh-tianshu-tui`, `turtle-ui`, and the
@@ -241,6 +263,14 @@ Windows 上 ACL 沙箱要求工作区目录对当前账号授予 **`WRITE_OWNER`
 **这是机器的属性，不是任何前端的问题**（Web、桌面端、终端一视同仁）。四种应对：
 把工作区放在沙箱可用的卷上 / 用 `--full-access` / 给目录加 `WRITE_OWNER`（**注意会留下常驻
 Low 标签，先读官方 `dsh-sandbox-windows-acl` 文档**）/ 保持默认模式逐条批准。
+
+**另一个独立的 Windows 前提：临时目录必须在工作区之外。** 在家目录里运行就会踩到
+（`%TEMP%` 在 `C:\Users\<你>` 里面），报 `Windows ACL temp root must be outside the workspace`，
+**所有 shell 命令全废，连读别的盘都做不到**。本工具会自动挑一个「在工作区之外且真的可写」的
+临时目录注入给 agent —— 工作区是家目录时，C 盘上唯一可写的外面就是 `C:\Users\Public\dshr-tmp`
+（不想用公共目录就从项目子目录运行，那样会用私有的 `~/.dshr-tmp`）。
+
+另注：**读取本来就不受沙箱限制**（只有写受限于工作区）—— 沙箱一旦能起来，agent 就能读你能读的任何地方。
 
 ## 与其他社区前端的区别
 
